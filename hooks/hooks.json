@@ -1,0 +1,33 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/j/code/pitabwire/coding_agents/hooks/pre-edit-config-protect.sh \"$TOOL_INPUT_FILE_PATH\"",
+            "statusMessage": "Checking config protection"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/j/code/pitabwire/coding_agents/hooks/post-edit-format.sh \"$TOOL_INPUT_FILE_PATH\"",
+            "statusMessage": "Auto-formatting"
+          },
+          {
+            "type": "command",
+            "command": "/home/j/code/pitabwire/coding_agents/hooks/post-edit-lint.sh \"$TOOL_INPUT_FILE_PATH\"",
+            "statusMessage": "Running linter"
+          }
+        ]
+      }
+    ]
+  }
+}
