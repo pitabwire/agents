@@ -1,8 +1,8 @@
 ---
 name: systems-engineering
 description: "Universal production-systems engineering methodology for designing and implementing complete, production-ready systems of any type (frontend, backend, platform, tooling, automation, hybrid). Enforces mandatory engineering goals: correctness, robustness, scalability, security, observability (OpenTelemetry), and operational simplicity. Use when: (1) designing new systems or major subsystems, (2) implementing production-grade components, (3) the user asks to 'build', 'design', or 'implement' a system, (4) work involves multiple interacting components, (5) the system must handle failures, concurrency, or multi-tenancy, (6) AI-powered or code-generating systems are involved. Do NOT use for trivial single-file changes, bug fixes, or questions."
-version: "1.0"
-last_updated: "2026-02-26"
+version: "1.1"
+last_updated: "2026-06-28"
 self_updating: true
 ---
 
@@ -46,9 +46,22 @@ Every system or component must satisfy ALL of these. If one cannot be met, state
 6. **Explicit failure handling** — every error path addressed
 7. **Explicit data ownership** — every piece of state has an owner
 8. **Strong isolation** — user, tenant, process, security boundaries
-9. **Minimal dependencies** — every dependency justified
-10. **Operational simplicity** — easy to deploy, monitor, debug
-11. **Safe defaults** — secure and conservative out of the box
+9. **Library-first reuse** — use proven existing capabilities before custom implementation
+10. **Minimal dependencies** — every dependency justified
+11. **Operational simplicity** — easy to deploy, monitor, debug
+12. **Safe defaults** — secure and conservative out of the box
+
+## Library-First Engineering
+
+Before implementing functionality:
+
+1. Inventory relevant standard-library, framework, generated-code, existing project, and maintained third-party capabilities.
+2. Use an existing capability when it satisfies correctness, security, performance, licensing, maintenance, and platform constraints.
+3. Prefer configuration, composition, or a thin adapter over copying or reimplementing algorithms, protocols, parsers, serializers, authentication, retries, synchronization, persistence, or infrastructure clients.
+4. Add a dependency only when its lifecycle cost is lower than owning the equivalent custom code.
+5. Write custom functionality only for a verified gap. Document the gap and keep the custom surface minimal, observable, and thoroughly tested.
+
+Treat duplicated library behavior as a correctness and maintenance defect.
 
 ## Prohibited Behaviors
 
@@ -78,6 +91,8 @@ Decompose every solution into five logical planes (some may collapse into one pr
 | **Integration** | External systems, providers, runtimes, APIs |
 
 For each plane: define responsibilities, public interfaces, and trust boundaries.
+
+For each responsibility, record the existing capability that will provide it or the verified gap requiring custom code.
 
 ### Phase 2: Define Execution Model
 

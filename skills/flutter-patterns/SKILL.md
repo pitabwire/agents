@@ -1,8 +1,8 @@
 ---
 name: flutter-patterns
 description: Production-grade Flutter patterns for building scalable, offline-first, resource-efficient applications with clean architecture, Riverpod 3.0 state management, and Drift database.
-version: "1.0"
-last_updated: "2026-02-26"
+version: "1.1"
+last_updated: "2026-06-28"
 self_updating: true
 ---
 
@@ -40,6 +40,16 @@ Apply these patterns when building, reviewing, or refactoring Flutter applicatio
 - **Riverpod 3.0** for state management
 - **ConnectRPC** for API connectivity (type-safe, streaming support)
 - **OpenID Connect** for authentication with secure token management
+
+## Library-First Implementation
+
+Before writing functionality, inspect the Dart and Flutter SDKs, current project packages, generated code, and established dependencies.
+
+- Use existing APIs when they meet correctness, security, performance, maintenance, and platform requirements.
+- Prefer configuration, composition, extensions, or thin adapters over recreating package behavior.
+- Do not hand-roll routing, state management, persistence, serialization, authentication, deep linking, retries, synchronization, cryptography, connectivity, background scheduling, or responsive primitives already supplied by the selected libraries.
+- Add a package only after checking existing dependencies and confirming maintenance, platform support, licensing, binary-size impact, and lifecycle cost.
+- Write custom functionality only for a verified gap; document the gap and keep the custom surface minimal, resource-efficient, and thoroughly tested.
 
 ---
 
@@ -3295,6 +3305,8 @@ class AppLogger {
 
 ## Checklist Before Committing
 
+- [ ] Existing SDK, Flutter, generated-code, and project package functionality reused before custom implementation
+- [ ] Any custom replacement for package functionality has a documented compatibility or correctness gap
 - [ ] All providers use `@riverpod` annotation
 - [ ] All models use `@freezed` annotation
 - [ ] Database streams used for reactive UI

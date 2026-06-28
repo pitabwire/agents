@@ -1,8 +1,8 @@
 ---
 name: golang-patterns
 description: Idiomatic Go patterns using the Frame framework (github.com/pitabwire/frame), Connect RPC, and pitabwire/util conventions. Use when writing, reviewing, refactoring, or scaffolding Go code. Enforces three-layer architecture (handlers/business/repository), Frame abstractions for all infrastructure (database, cache, queue, HTTP, logging, telemetry), data.BaseModel for all models, datastore.BaseRepository for all repositories, util.Log(ctx) for all logging, and Connect RPC for all APIs. Also use when creating new Go projects or services (Frame blueprint scaffolding).
-version: "2.0"
-last_updated: "2026-03-13"
+version: "2.1"
+last_updated: "2026-06-28"
 self_updating: true
 ---
 
@@ -77,6 +77,16 @@ For manual creation (without blueprint), copy asset files from `golang-patterns/
 ## Mandatory Rules
 
 These rules apply to ALL Go code. Violations fail code review.
+
+### 0. Reuse before implementation
+
+Inspect the Go standard library, Frame, pitabwire/util, generated Connect/protobuf code, and existing project packages before writing new functionality.
+
+- Use the existing implementation when it meets correctness, security, performance, and maintenance requirements.
+- Configure, compose, or add a thin adapter around library APIs instead of copying or recreating their behavior.
+- Do not hand-roll protocols, serialization, authentication, retry/backoff, concurrency primitives, validation, IDs, infrastructure clients, or collection helpers already provided by these libraries.
+- Add a third-party module only after confirming existing dependencies do not provide the capability and the module is maintained, compatible, licensed appropriately, and cheaper to own than custom code.
+- Implement custom behavior only for a verified gap; document why available libraries are insufficient and keep the implementation minimal and thoroughly tested.
 
 ### 1. Always use Frame abstractions
 
@@ -279,6 +289,8 @@ func initResources(_ context.Context) []definition.TestResource {
 - [ ] No `log.Println()`, `log.Fatalf()`, `slog`, `fmt.Printf()` for logging
 
 **Code:**
+- [ ] Existing standard-library, Frame, util, generated-code, and project capabilities were reused before adding custom code
+- [ ] Any custom replacement for library functionality has a documented compatibility or correctness gap
 - [ ] All models embed `data.BaseModel` with `TableName()` method
 - [ ] All repositories use `datastore.BaseRepository` or raw pool with interface
 - [ ] Three-layer architecture: handlers -> business -> repository

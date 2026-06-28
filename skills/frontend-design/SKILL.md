@@ -1,8 +1,8 @@
 ---
 name: frontend-design
 description: Create distinctive, production-grade frontend interfaces with high design quality. Use this skill when the user asks to build web components, pages, artifacts, posters, or applications (examples include websites, landing pages, dashboards, React components, HTML/CSS layouts, or when styling/beautifying any web UI). Generates creative, polished code and UI design that avoids generic AI aesthetics.
-version: "1.0"
-last_updated: "2026-02-26"
+version: "1.1"
+last_updated: "2026-06-28"
 self_updating: true
 license: Complete terms in LICENSE.txt
 ---
@@ -32,6 +32,15 @@ license: Complete terms in LICENSE.txt
 This skill guides creation of distinctive, production-grade frontend interfaces that avoid generic "AI slop" aesthetics. Implement real working code with exceptional attention to aesthetic details and creative choices.
 
 The user provides frontend requirements: a component, page, application, or interface to build. They may include context about the purpose, audience, or technical constraints.
+
+## Library-First Implementation
+
+Before implementing, inventory the framework, design system, component library, utility packages, browser APIs, and existing project components.
+
+- Reuse accessible, tested components and platform capabilities when they satisfy the intended design and performance.
+- Prefer composition, theming, configuration, or thin wrappers over recreating routing, forms, validation, focus management, overlays, virtualization, internationalization, animation primitives, or accessibility behavior.
+- Add a dependency only when it is maintained, compatible, appropriately licensed, tree-shakeable where applicable, and cheaper to own than custom code.
+- Build custom functionality only for a verified design or capability gap. Document the gap and keep the custom surface minimal, accessible, and tested.
 
 ## Design Thinking
 
