@@ -1,7 +1,7 @@
 ---
 name: flutter-patterns
 description: Production-grade Flutter patterns for building scalable, offline-first, resource-efficient applications with clean architecture, Riverpod 3.0 state management, and Drift database.
-version: "1.1"
+version: "1.2"
 last_updated: "2026-06-28"
 self_updating: true
 ---
@@ -50,6 +50,8 @@ Before writing functionality, inspect the Dart and Flutter SDKs, current project
 - Do not hand-roll routing, state management, persistence, serialization, authentication, deep linking, retries, synchronization, cryptography, connectivity, background scheduling, or responsive primitives already supplied by the selected libraries.
 - Add a package only after checking existing dependencies and confirming maintenance, platform support, licensing, binary-size impact, and lifecycle cost.
 - Write custom functionality only for a verified gap; document the gap and keep the custom surface minimal, resource-efficient, and thoroughly tested.
+
+For Antinvestor applications, inspect `/home/j/code/antinvestor/common/ui_core` and the current `antinvestor_ui_core` package before implementing shared UI or application infrastructure. Reuse its theme and design tokens, admin/entity pages, analytics dashboards and charts, permission manifests and guards, auth/role/tenancy/audit context, navigation and route modules, API and paginated-stream helpers, responsive layouts, logging, badges, forms, money display, breadcrumbs, headers, and signature widgets. Verify current exports in `lib/antinvestor_ui_core.dart`; do not rely only on this summary.
 
 ---
 
@@ -3306,6 +3308,7 @@ class AppLogger {
 ## Checklist Before Committing
 
 - [ ] Existing SDK, Flutter, generated-code, and project package functionality reused before custom implementation
+- [ ] `antinvestor_ui_core` inspected before adding shared UI, auth, routing, permission, analytics, responsive, or API infrastructure
 - [ ] Any custom replacement for package functionality has a documented compatibility or correctness gap
 - [ ] All providers use `@riverpod` annotation
 - [ ] All models use `@freezed` annotation

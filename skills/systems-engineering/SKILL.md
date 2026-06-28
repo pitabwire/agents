@@ -1,7 +1,7 @@
 ---
 name: systems-engineering
 description: "Universal production-systems engineering methodology for designing and implementing complete, production-ready systems of any type (frontend, backend, platform, tooling, automation, hybrid). Enforces mandatory engineering goals: correctness, robustness, scalability, security, observability (OpenTelemetry), and operational simplicity. Use when: (1) designing new systems or major subsystems, (2) implementing production-grade components, (3) the user asks to 'build', 'design', or 'implement' a system, (4) work involves multiple interacting components, (5) the system must handle failures, concurrency, or multi-tenancy, (6) AI-powered or code-generating systems are involved. Do NOT use for trivial single-file changes, bug fixes, or questions."
-version: "1.1"
+version: "1.2"
 last_updated: "2026-06-28"
 self_updating: true
 ---
@@ -56,10 +56,13 @@ Every system or component must satisfy ALL of these. If one cannot be met, state
 Before implementing functionality:
 
 1. Inventory relevant standard-library, framework, generated-code, existing project, and maintained third-party capabilities.
-2. Use an existing capability when it satisfies correctness, security, performance, licensing, maintenance, and platform constraints.
-3. Prefer configuration, composition, or a thin adapter over copying or reimplementing algorithms, protocols, parsers, serializers, authentication, retries, synchronization, persistence, or infrastructure clients.
-4. Add a dependency only when its lifecycle cost is lower than owning the equivalent custom code.
-5. Write custom functionality only for a verified gap. Document the gap and keep the custom surface minimal, observable, and thoroughly tested.
+2. For Antinvestor systems, inspect the current source under `/home/j/code/antinvestor/common` before designing custom backend or UI infrastructure.
+3. Use an existing capability when it satisfies correctness, security, performance, licensing, maintenance, and platform constraints.
+4. Prefer configuration, composition, or a thin adapter over copying or reimplementing algorithms, protocols, parsers, serializers, authentication, retries, synchronization, persistence, or infrastructure clients.
+5. Add a dependency only when its lifecycle cost is lower than owning the equivalent custom code.
+6. Write custom functionality only for a verified gap. Document the gap and keep the custom surface minimal, observable, and thoroughly tested.
+
+`antinvestor/common` includes shared Go service clients and options, HTTP/Connect/gRPC/OAuth/workload transports, authentication/logging/partition interceptors, permissions and generated protobuf types, OpenAPI/OPL handlers, audit support, Timescale helpers, build templates, and the Flutter `antinvestor_ui_core` package. Treat this list as routing guidance and inspect the current source because the repository evolves.
 
 Treat duplicated library behavior as a correctness and maintenance defect.
 

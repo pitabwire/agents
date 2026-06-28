@@ -1,7 +1,7 @@
 ---
 name: frontend-design
 description: Create distinctive, production-grade frontend interfaces with high design quality. Use this skill when the user asks to build web components, pages, artifacts, posters, or applications (examples include websites, landing pages, dashboards, React components, HTML/CSS layouts, or when styling/beautifying any web UI). Generates creative, polished code and UI design that avoids generic AI aesthetics.
-version: "1.1"
+version: "1.2"
 last_updated: "2026-06-28"
 self_updating: true
 license: Complete terms in LICENSE.txt
@@ -41,6 +41,8 @@ Before implementing, inventory the framework, design system, component library, 
 - Prefer composition, theming, configuration, or thin wrappers over recreating routing, forms, validation, focus management, overlays, virtualization, internationalization, animation primitives, or accessibility behavior.
 - Add a dependency only when it is maintained, compatible, appropriately licensed, tree-shakeable where applicable, and cheaper to own than custom code.
 - Build custom functionality only for a verified design or capability gap. Document the gap and keep the custom surface minimal, accessible, and tested.
+
+For Antinvestor Flutter interfaces, inspect `/home/j/code/antinvestor/common/ui_core` and current `antinvestor_ui_core` exports first. Prefer its theme and tokens, admin/entity pages, analytics components, permission guards, auth and tenancy context, navigation and route composition, responsive layouts, API stream helpers, badges, forms, money display, breadcrumbs, headers, and signature widgets. Extend or compose these primitives instead of creating a parallel design system; verify the current source because the package evolves.
 
 ## Design Thinking
 
