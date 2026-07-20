@@ -100,7 +100,7 @@ All per-service namespaces that receive role/permission tuples:
 - `service_ledger`
 - `service_commerce`
 - `service_trustage`
-- `service_notifications`
+- `service_notification`
 - `service_profile`
 - `service_devices`
 

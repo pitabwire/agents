@@ -1,6 +1,6 @@
 ---
 name: antinvestor-service-exposure
-description: Standards and workflow for exposing Antinvestor services via Gateway API and unified APIs in the service_deployments repo (HTTPRoute composition, DNS policy, and exceptions).
+description: Standards and workflow for exposing Antinvestor services via Gateway API and unified APIs in the deployments repo (HTTPRoute composition, DNS policy, and exceptions).
 ---
 
 # Antinvestor Service Exposure
@@ -63,6 +63,27 @@ For public admin APIs, use allowOrigins:
 - `http://localhost:5173`
 
 For public unauthenticated swagger or key endpoints, `allowOrigins: ["*"]` is acceptable when cookies are not used.
+
+### Required CORS `allowHeaders`
+
+Every service route MUST include these headers in `allowHeaders`:
+
+**Standard headers:**
+- `Authorization`, `Content-Type`, `Accept`, `Origin`, `X-Requested-With`
+
+**Cross-tenant administration headers:**
+- `X-Tenant-Id` — target tenant for internal role users
+- `X-Partition-Id` — target partition for internal role users
+- `X-Access-Id` — target access grant for internal role users
+
+These three headers are required by Frame's `EnrichTenancyClaims` mechanism. Without them in CORS, browsers block the preflight and cross-tenant admin operations fail silently.
+
+**Connect RPC / gRPC headers:**
+- `Connect-Protocol-Version`, `Connect-Timeout-Ms`, `Connect-Content-Encoding`, `Connect-Accept-Encoding`
+- `Grpc-Timeout`, `X-Grpc-Web`, `X-User-Agent`
+
+**Observability headers:**
+- `Baggage`, `Traceparent`, `Tracestate`
 
 ## Safety Checks
 

@@ -1,8 +1,8 @@
 ---
 name: rebac-authorization
-description: "Comprehensive guide for the Relationship-Based Access Control (ReBAC) authorization system built on Ory Keto. Covers the two-plane model (data access vs functional roles), explicit per-namespace service account permissions, Keto tuple builders, OPL namespaces, partition inheritance, middleware, and event-driven tuple management. Use when working on authorization, permissions, access control, Keto tuples, or service bot access in the antinvestor platform."
-version: "3.0"
-last_updated: "2026-03-15"
+description: "Comprehensive guide for the Relationship-Based Access Control (ReBAC) authorization system built on Ory Keto. Covers the three-plane model (data access, functional roles, per-resource access), contextual constraints (time/location), explicit per-namespace service account permissions, Keto tuple builders, OPL namespaces with permits, partition inheritance, ResourceAccessChecker, middleware, and event-driven tuple management. Use when working on authorization, permissions, access control, Keto tuples, constraints, or service bot access in the antinvestor platform."
+version: "6.3"
+last_updated: "2026-07-11"
 self_updating: true
 ---
 
@@ -46,48 +46,93 @@ Apply this knowledge when:
 
 ## Architecture Overview
 
-Authorization operates on **two distinct planes** using Ory Keto as the ReBAC engine:
+Authorization operates on **three distinct planes** using Ory Keto as the ReBAC engine:
 
 ### Plane 1 — Data Access (`tenancy_access` namespace)
 - **Question:** "Can profile X access data in partition B?"
 - **Cross-service:** If a profile has access to partition B, that applies in every service
-- **Inheritance:** Child partitions inherit membership from parent partitions via subject sets
+- **Inheritance:** Child partitions inherit membership from parent partitions via `SubjectSet<tenancy_access, "member">` chains
 - **Relations:** `member` (regular users), `service` (service bots)
+- **Checker:** `TenancyAccessChecker` — supports constraints via `WithTenancyConstraints()`
 
 ### Plane 2 — Functional Permissions (per-service namespaces)
 - **Question:** "What can profile Z do in service G?"
 - **Per-service:** Each service checks permissions in its own namespace
-- **Service accounts get explicit per-permission grants** — no blanket access
-- **Users get role-based grants** — OPL resolves permissions from role tuples
+- **Service accounts get explicit per-permission grants** (`granted_*` tuples) — no blanket access
+- **Users get role-based grants** — OPL `permits` resolve permissions from role tuples (owner > admin > operator > member)
+- **Checker:** `FunctionChecker` — supports constraints via `WithFunctionConstraints()` and per-permission via `WithFunctionPermissionConstraints()`
+
+### Plane 3 — Resource Access (per-resource namespaces)
+- **Question:** "Can profile Y access this specific resource right now?"
+- **Per-resource-instance:** Checks individual resource IDs (room, file, etc.)
+- **Namespaces:** `chat_room`, `file`, and future resource types
+- **OPL permits:** Role hierarchy with computed permissions (e.g., `chat_room` owner > admin > member > viewer)
+- **Contextual constraints:** Time-of-day, location, or custom conditions evaluated after Keto check
+- **Checker:** `ResourceAccessChecker` — supports `WithConstraints()`, `WithPermissionConstraints()`, `Grant()`, `Revoke()`, `Members()`
 
 ### Key Design Principles
-1. **`profile_id` is the universal identity** — all Keto subjects use `profile_user:profileID`
-2. **JWT `sub` = `profile_id`** — for service accounts, the token webhook overrides Hydra's default `sub` (client_id) to `profile_id` via `writeTokenHookResponseWithSubject`
-3. **Plane 1 always checked first** — `TenancyAccessChecker` interceptor runs before handler-level functional checks
-4. **Least privilege for service accounts** — each SA declares exactly which permissions it needs per namespace
+1. **JWT `sub` === `profile_id` always** — the acting principal for ReBAC. Never use OAuth `client_id` as a Keto subject.
+2. **`client_id` is for login / partition binding only** — identifies which OAuth client (and partition) the token is for, not who is acting.
+3. **Hydra wire quirk is not a model exception** — Hydra v26 may leave wire `sub=client_id` for `client_credentials`; token hook still sets `profile_id`; Frame `NormalizeIdentity()` rewrites in-process `Subject` to `profile_id` so checkers see the invariant.
+4. **Plane 1 always checked first** — `TenancyAccessChecker` interceptor runs before handler-level functional checks
+5. **Least privilege for service accounts** — each SA declares exactly which permissions it needs per namespace
+6. **Internal role string is `"internal"`** (Frame `ConstantSystemInternalRole`). SA type/`system_int` scope map to role `"internal"` at token enrichment
+
+Canonical doc: service-authentication `docs/IDENTITY_AND_AUTHORIZATION.md`.
 
 ---
 
 ## Identity Lifecycle
 
 ### Service Account Token Issuance
-1. SA calls Hydra with `grant_type=client_credentials`, `client_id`, `client_secret`
+1. SA calls Hydra with `grant_type=client_credentials`, `client_id` (+ private_key_jwt or secret)
 2. Hydra calls token enrichment webhook (`handleServiceAccountEnrichment`)
-3. Webhook looks up SA via Hydra admin API → extracts `profile_id` from `client.metadata`
-4. Sets `roles = ["system_internal"]` (or `["system_external"]`)
-5. Calls `writeTokenHookResponseWithSubject(rw, claims, sa.ProfileID)` — **overrides JWT `sub` to `profile_id`**
-6. JWT issued: `sub = profileID`, `roles = ["system_internal"]`, `tenant_id`, `partition_id`
+3. Webhook looks up Hydra client metadata → `profile_id`, `tenant_id`, `partition_id`, `type`
+4. Sets `roles = ["internal"]` (or external type) from metadata `type` / scope
+5. Returns session extras including **`profile_id` (actor)**, tenancy claims, roles
+6. JWT may still have `sub = client_id` (Hydra); **authorization uses `profile_id`**
+7. Keto grants for this SA use **subject = `profile_id`** (SA sync + service bot bootstrap)
 
 ### User Token Issuance
 1. User completes login → consent flow (`ShowConsentEndpoint`)
 2. `buildUserTokenClaims` extracts `LoginEvent` with `profileID`, `tenantID`, `partitionID`, `accessID`
 3. Fetches roles from `AccessRole` records → e.g., `["admin"]`
-4. JWT: `sub = profileID`, `roles = ["admin"]`, `tenant_id`, `partition_id`
+4. **Root-tenant admin/owner check** (`isRootAdminOrOwner`): if `tenantID == rootTenantID` AND `partitionID == rootPartitionID` AND roles contain `"owner"` or `"admin"` → appends `"internal"` role
+5. JWT: `sub = profileID`, `roles = ["admin", "internal"]`, `tenant_id`, `partition_id`
 
-### How `system_internal` Affects Runtime
+### Root Tenant Constants (`login_step_4_consent.go`)
+| Constant | Value | Purpose |
+|----------|-------|---------|
+| `rootTenantID` | `c2f4j7au6s7f91uqnojg` | Root tenant for super user detection |
+| `rootPartitionID` | `c2f4j7au6s7f91uqnokg` | Root partition for super user detection |
+
+### Super User Bootstrapping (`seed_super_user.go`)
+```bash
+service-authentication seed-super-user --email user@example.com --environment production
+```
+Creates profile → access on root partition → assigns `"owner"` role → user gets `"internal"` in JWT on next login.
+
+### How `system_internal` / `internal` Affects Runtime
 1. `ClaimsToContext`: calls `SkipTenancyChecksOnClaims` → bypasses DB-level tenancy filters
 2. `TenancyAccessChecker.CheckAccess`: switches Keto relation from `"member"` to `"service"`
 3. `ClaimsFromContext`: enriches claims from secondary tenancy claims via `EnrichTenancyClaims`
+
+### Cross-Tenant Impersonation (EnrichTenancyClaims)
+
+Users with the `"internal"` role can operate across tenants via header-based context switching:
+
+1. **Frontend** sends `X-Tenant-Id`, `X-Partition-Id`, `X-Access-Id` headers with the target tenant
+2. **Frame's `AuthenticationMiddleware`** (all transports: HTTP, Connect, gRPC) calls `EnrichTenancyClaims(ctx, tenantID, partitionID, accessID)` with values from these headers
+3. **`EnrichTenancyClaims`** checks `claims.isInternalSystem()` — if false, headers are silently ignored (security: non-internal users cannot override tenant)
+4. If internal, stores secondary claims via `util.SetTenancy(ctx, secondaryClaims)`
+5. **`ClaimsFromContext`** detects internal user → merges secondary claims → returns enriched claims with overridden `TenantID`, `PartitionID`, `AccessID`
+6. All downstream code (`GetTenantID()`, `GetPartitionID()`) transparently receives the target tenant
+
+**BFF (service-thesa) Pattern:** The BFF's `KetoPolicyEvaluator` grants **all capabilities** to users with the `"internal"` role without Keto checks, since they have no Keto tuples on non-root tenants. This is safe because the `"internal"` role is only granted to root-tenant owners/admins.
+
+**CORS requirement:** Gateway and BFF CORS configs must include `X-Tenant-Id`, `X-Partition-Id`, `X-Access-Id` in `allowHeaders`.
+
+**Security invariant:** Regular users cannot inject tenant headers — `EnrichTenancyClaims` is a no-op unless `isInternalSystem()` returns true. Existing security tests verify this (`TestSecurity_TenantIDFromJWT_NotRequestHeader`).
 
 ---
 
@@ -110,7 +155,7 @@ Authorization operates on **two distinct planes** using Ory Keto as the ReBAC en
 | `service_profile` | Profile | profile_view/create/update, contacts_manage, roster_manage, devices_manage/view, settings_manage/view |
 | `service_payment` | Payment | payment_send/receive, payments_search, payment_status_view/update, reconcile |
 | `service_ledger` | Payment | ledger_manage/view, account_manage/view, transaction_create/reverse/update/view |
-| `service_notifications` | Notifications | notification_send/release/search/status_view/status_update, template_manage/view |
+| `service_notification` | Notifications | notification_send/release/search/status_view/status_update, template_manage/view |
 | `service_commerce` | Commerce | shop_create, shops_view |
 | `service_trustage` | Trustage | event_ingest, workflow_manage/view, form_definition_manage/view, queue_manage/view |
 | `chat_room` | Chat | view, message_send, update, delete, members_manage (per-resource) |
@@ -182,14 +227,16 @@ Each SA declares per-namespace permissions in its `Audiences` field:
 {"service_profile": ["tenant_view", "partition_view"], "service_tenancy": ["tenant_view"]}
 ```
 
-Tuples written by `AuthzServiceAccountSyncEvent`:
+Tuples written by `AuthzServiceAccountSyncEvent` (subject = **profile_id**):
 ```
-tenancy_access:t/p#member           ← profile_user:profileID     (Plane 1)
-tenancy_access:t/p#service          ← profile_user:profileID     (Plane 1)
-service_profile:t/p#granted_tenant_view     ← profile_user:profileID  (Plane 2)
-service_profile:t/p#granted_partition_view  ← profile_user:profileID  (Plane 2)
-service_tenancy:t/p#granted_tenant_view     ← profile_user:profileID  (Plane 2)
+tenancy_access:t/p#service                    ← profile_id   (Plane 1)
+service_profile:t/p#granted_profile_view      ← profile_id   (Plane 2)
+service_profile:t/p#granted_partition_view    ← profile_id   (Plane 2)
+service_tenancy:t/p#granted_tenant_view       ← profile_id   (Plane 2)
 ```
+
+Service bot bootstrap (`EnsureServiceBotTenancyAccess`) writes Plane-1 `#service`
+for every SA **profile_id** across all known partitions so restarts self-heal.
 
 ### Legacy Format (Backward Compatible)
 
@@ -223,7 +270,7 @@ If partition has a parent:
 
 ---
 
-## Two-Checker Architecture
+## Three-Checker Architecture (frame v1.91.0+)
 
 ### Layer 1 — `TenancyAccessChecker` (Data Access — All Transports)
 
@@ -233,15 +280,85 @@ If partition has a parent:
 
 Wired as interceptor on all transports (Connect, HTTP, gRPC).
 
-### Layer 2 — `FunctionChecker` (Functional Permissions — Per-Handler)
+### Layer 2 — `FunctionAccessInterceptor` (Functional Permissions — Automatic)
 
-`Check(ctx, permission)` checks specific permission in the service's namespace.
-- Namespace configured at construction: `NewFunctionChecker(auth, "service_profile")`
-- Object: `tenantID/partitionID` from claims
+**Automatic enforcement from proto annotations.** The `FunctionAccessInterceptor` reads a procedure→permissions map built from proto `method_permissions` and checks each permission via `FunctionChecker` before the handler runs.
+
+```go
+sd := profilepb.File_profile_v1_profile_proto.Services().ByName("ProfileService")
+procMap := permissions.BuildProcedureMap(sd)
+functionChecker := authorizer.NewFunctionChecker(auth, "service_profile")
+functionAccessInterceptor := connectInterceptors.NewFunctionAccessInterceptor(functionChecker, procMap)
+```
+
+- **No manual `authz.CanXxx()` calls needed** for tenant-level checks
+- Resource-level checks (per-room, per-file, per-shop) stay in handlers — interceptor is complementary
+- Self-bypass RPCs are excluded from procMap and checked inline with `FunctionChecker.Check()`
+
+### Layer 2 (Legacy) — `FunctionChecker` Direct
+
+`Check(ctx, permission)` checks specific permission in the service's namespace. Used only for:
+- Self-bypass inline checks in handlers
+- Resource-level checks that the interceptor can't handle
+
+### Layer 3 — `ResourceAccessChecker` (Per-Resource — Handler Level)
+
+Checks access to individual resource instances (rooms, files, etc.):
+
+```go
+roomChecker := authorizer.NewResourceAccessChecker(auth, "chat_room",
+    authorizer.WithConstraints(
+        authorizer.TimeWindowConstraint(9, 17, time.UTC),
+    ),
+    authorizer.WithPermissionConstraints("delete",
+        authorizer.LocationConstraint("office-nairobi"),
+    ),
+)
+
+// In handler:
+err := roomChecker.Check(ctx, roomID, "send_message")
+
+// Or with explicit subject:
+err := roomChecker.CheckSubject(ctx, roomID, "manage", subjectID)
+
+// Grant/revoke:
+roomChecker.Grant(ctx, roomID, "member", profileID)
+roomChecker.Revoke(ctx, roomID, "member", profileID)
+```
+
+### Contextual Constraints (All Checkers)
+
+Constraints are evaluated **after** the Keto relation check passes. Available on all three checkers.
+
+**Built-in constraints:**
+- `TimeWindowConstraint(startHour, endHour, *time.Location)` — daily time window, midnight wrap supported
+- `LocationConstraint(allowed...)` — case-insensitive location allowlist
+- `AnyConstraint(a, b, c)` — OR combinator (passes if any sub-constraint passes)
+
+**Constraint options per checker:**
+| Checker | Global constraints | Per-permission constraints |
+|---------|-------------------|--------------------------|
+| `TenancyAccessChecker` | `WithTenancyConstraints()` | — |
+| `FunctionChecker` | `WithFunctionConstraints()` | `WithFunctionPermissionConstraints(perm, ...)` |
+| `ResourceAccessChecker` | `WithConstraints()` | `WithPermissionConstraints(perm, ...)` |
+
+**Context injection (required by middleware or handler):**
+```go
+ctx = authorizer.WithCurrentTime(ctx, time.Now())
+ctx = authorizer.WithLocation(ctx, "office-nairobi")
+```
+
+**Panic recovery:** All constraint evaluation is wrapped in `recover()` — a panicking constraint produces a `PermissionDeniedError`, not a crash.
+
+**Constraint denials are logged** with `denial_source: "constraint"` field to distinguish from Keto denials.
 
 ### Keto Adapter Subject Format
 
-`toKetoSubject(SubjectRef)`: if `Namespace != ""` → sends Keto `SubjectSet(namespace, id, relation)`. Both checkers set `SubjectRef{Namespace: "profile_user", ID: subjectID}` → becomes `SubjectSet("profile_user", subjectID, "")`.
+`toKetoSubject(SubjectRef)` (frame v2):
+- if `Namespace != ""` **and** `Relation != ""` → Keto `SubjectSet(namespace, id, relation)`
+- otherwise → Keto bare `SubjectID(id)`
+
+Checkers set `SubjectRef{Namespace: "profile_user", ID: **profileID**}` with empty Relation → bare `subject_id = profile_id`. Grants must use the same profile id.
 
 ---
 
@@ -249,13 +366,13 @@ Wired as interceptor on all transports (Connect, HTTP, gRPC).
 
 ### Service-to-Service Call
 ```
-1. SA → Hydra (client_credentials) → webhook overrides sub=profileID
-2. JWT: {sub: profileID, roles: ["system_internal"], tenant_id, partition_id}
-3. Service B: JWT validated → AuthenticationClaims populated
+1. SA → Hydra (client_credentials) → webhook adds profile_id/roles/tenancy; sub may stay client_id
+2. JWT: {sub: "service-authentication", roles: ["internal"], tenant_id, partition_id, profile_id: "d75q…"}
+3. Service B: JWT validated → GetProfileID() = "d75q…" (claim wins over sub)
 4. TenancyAccessChecker: IsInternalSystem()=true → relation="service"
-   → Keto: tenancy_access:t/p#service for profile_user:profileID → ALLOWED
+   → Keto: tenancy_access:t/p#service subject_id=d75q… → ALLOWED
 5. FunctionChecker: Check(ctx, "profile_view")
-   → Keto: service_profile:t/p#granted_profile_view for profile_user:profileID → ALLOWED
+   → Keto: service_profile:t/p#granted_profile_view subject_id=d75q… → ALLOWED
 ```
 
 ### User Request
@@ -298,10 +415,23 @@ Wired as interceptor on all transports (Connect, HTTP, gRPC).
 | `apps/default/service/handlers/login_step_4_consent.go` | User consent → token claims |
 | `keto/namespaces/tenancy.ts` | Production OPL schema |
 | *frame:* `security/security_claims.go` | `GetSubject`, `GetProfileID`, `ClaimsFromContext`, `IsInternalSystem` |
-| *frame:* `security/authorizer/client.go` | Keto gRPC adapter, `toKetoSubject` |
-| *frame:* `security/authorizer/tenancy_permission_checker.go` | TenancyAccessChecker (Plane 1) |
-| *frame:* `security/authorizer/function_checker.go` | FunctionChecker (Plane 2) |
-| *frame:* `security/interceptors/connect/tenancy_access.go` | Connect interceptor |
+| *frame:* `security/authorizer/client.go` | Keto gRPC adapter, `toKetoSubject`, parallelized `BatchCheck` via WorkerPool |
+| *frame:* `security/authorizer/tenancy_permission_checker.go` | TenancyAccessChecker (Plane 1), `WithTenancyConstraints()` |
+| *frame:* `security/authorizer/function_checker.go` | FunctionChecker (Plane 2), `WithFunctionConstraints()`, `WithFunctionPermissionConstraints()` |
+| *frame:* `security/authorizer/resource_access_checker.go` | ResourceAccessChecker (Plane 3), `WithConstraints()`, `WithPermissionConstraints()`, `Grant()`, `Revoke()`, `Members()` |
+| *frame:* `security/authorizer/constraints.go` | `AccessConstraint`, `TimeWindowConstraint`, `LocationConstraint`, `AnyConstraint`, context helpers |
+| *frame:* `security/interceptors/connect/tenancy_access.go` | Connect tenancy interceptor (Plane 1) |
+| *frame:* `security/interceptors/connect/function_access.go` | Connect function access interceptor (Plane 2 — automatic) |
+| *frame:* `security/interceptors/httptor/function_access.go` | HTTP function access middleware |
+| *frame:* `opl_endpoints.go` | `/_internal/opl/` endpoint serving |
+| *common:* `permissions/permissions.go` (`github.com/antinvestor/common`) | `BuildProcedureMap()`, `ForService()`, `ForMethod()` |
+| *common:* `tools/generate-opl/main.go` | OPL generator from proto descriptors |
+| *common:* `tools/inject-permissions/main.go` | OpenAPI permission injection |
+| *common:* `proto/common/v1/permissions.proto` | `ServicePermissions`, `MethodPermissions`, `StandardRole`, `RoleBinding` |
+| *per-service:* `proto/{service}/v1/{service}.proto` | Service proto with `service_permissions` + `method_permissions` |
+| *per-service:* `apps/{app}/{service}.openapi.yaml` | Generated OpenAPI with `x-required-permissions` |
+| *per-service:* `opl/{service}/service_{name}.opl.ts` | Generated Keto OPL (function access — from `generate-opl`) |
+| *per-service:* `opl/{service}/{name}_resources.opl.ts` | Hand-authored resource OPL (Plane 3 — chat_room, file, etc.) |
 
 ---
 
@@ -315,20 +445,53 @@ Set audiences in new format:
 Then trigger sync (`/_system/sync/clients`) to rewrite Keto tuples.
 
 ### Adding a New Service Namespace
-1. Create OPL class following existing patterns (include `granted_*` relations)
-2. Service accounts declare the namespace in their audiences
-3. The service's OAuth2 audience must match the namespace name
+1. **Define in proto**: Add `service_permissions` with namespace, permissions, and role_bindings to the service proto
+2. **Run `generate-opl`**: `buf build proto/<svc> -o /dev/stdout | generate-opl opl/` — generates OPL to standard `opl/` directory
+3. **Wire interceptor** (derive namespace from proto, never hardcode):
+```go
+sd := servicepb.File_service_v1_service_proto.Services().ByName("MyService")
+procMap := permissions.BuildProcedureMap(sd)
+functionChecker := authorizer.NewFunctionChecker(auth, permissions.ForService(sd).Namespace)
+functionAccessInterceptor := connectInterceptors.NewFunctionAccessInterceptor(functionChecker, procMap)
+```
+4. **Register OPL**: `frame.WithOPL("namespace", oplData)` to serve at `/_internal/opl/`
+5. Service accounts declare the namespace in their audiences
+
+### Adding Resource-Level Access (Plane 3)
+1. **Create OPL file**: `opl/{name}_resources.opl.ts` with resource namespaces (e.g., `chat_room`, `file`)
+2. **Define roles + permits**: owner > admin > member > viewer with computed permissions
+3. **Wire checker** in handler:
+```go
+roomChecker := authorizer.NewResourceAccessChecker(auth, "chat_room")
+err := roomChecker.Check(ctx, roomID, "send_message")
+```
 
 ### Adding a New Permission
-1. Add constant to `constants.go`
-2. Add to appropriate roles in `RolePermissions` map
-3. Add `granted_<permission>` relation to OPL namespace classes
-4. Wire permission check in handler via FunctionChecker
+1. **Add to proto**: Add permission string to `service_permissions.permissions` and appropriate `role_bindings`
+2. **Add to RPC**: Add `method_permissions` to the RPC that requires it
+3. **Run `generate-opl`**: Regenerates OPL in `opl/` with new permission
+4. **No code changes needed** — interceptor automatically picks up the new permission
+5. For self-bypass: `delete(procMap, "/pkg.Svc/Method")` and add inline `checker.Check()` in handler
+
+### OPL Directory Convention
+All OPL files live under `opl/{service}/` at the repo root, one subfolder per service namespace:
+```
+opl/
+  chat/
+    service_chat.opl.ts          # Generated (Plane 2 functional roles)
+    chat_resources.opl.ts        # Hand-authored (Plane 3 per-resource access)
+  files/
+    file_resources.opl.ts        # Hand-authored (Plane 3)
+```
+- Generate with: `buf build proto/<svc> -o /dev/stdout | generate-opl opl/<svc>/`
+- The `opl-push` workflow recursively collects `*.opl.ts` from `opl/` and pushes to the deployments repo
 
 ### Debugging Permission Denied
-1. Check claims: `ClaimsFromContext(ctx)` has TenantID, PartitionID, Subject (= profileID)
-2. Verify Plane 1: `tenancy_access:path#member` (user) or `#service` (SA) exists
-3. Verify Plane 2: `ns:path#granted_<perm>` (SA) or `ns:path#<role>` (user) exists
-4. For SAs: check `ParseAudiencePermissions(sa.Audiences)` returns expected permissions
-5. For partition inheritance: verify parent→child tuple in `tenancy_access`
-6. Query Keto: `wget -qO- 'http://keto-read:4466/relation-tuples?namespace=<ns>&object=<path>'`
+1. Check claims: `GetProfileID()`, TenantID, PartitionID — actor must be **profile_id**
+2. Verify Plane 1: `tenancy_access:path#member` (user) or `#service` (SA) for that **profile_id**
+3. Verify Plane 2: `ns:path#granted_<perm>` (SA) or `ns:path#<role>` (user) for that profile
+4. If the error text shows a **client_id** (e.g. `service-authentication`), Frame is still using JWT `sub` — upgrade frame so checkers use `GetProfileID()`; do **not** re-key Keto to client_id
+5. Confirm token extras include `profile_id` and role `"internal"` for SAs
+6. For partition inheritance: verify parent→child tuple in `tenancy_access`
+7. Query Keto: `wget -qO- 'http://keto-read:4466/relation-tuples?namespace=<ns>&object=<path>'`
+8. Canonical identity rules: service-authentication `docs/IDENTITY_AND_AUTHORIZATION.md`

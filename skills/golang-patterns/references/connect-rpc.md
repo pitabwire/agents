@@ -15,21 +15,42 @@
 
 ## API Structure
 
-Projects in the antinvestor ecosystem use `github.com/antinvestor/apis` for shared proto definitions. Standalone projects define protos locally in `proto/`.
+Each service repo owns its proto definitions. Shared types live in `github.com/antinvestor/common`. Go clients are BSR-generated.
 
+**Per-service repo structure:**
 ```
-github.com/antinvestor/apis/
-├── go/
-│   ├── common/v1/                  # Shared types
-│   ├── notification/v1/            # Notification service APIs
-│   │   ├── notification.pb.go
-│   │   └── notificationv1connect/
-│   │       └── notification.connect.go
-│   └── profile/v1/                 # Profile service APIs
-│       ├── profile.pb.go
-│       └── profilev1connect/
-│           └── profile.connect.go
-└── proto/                          # Proto source files
+service-profile/
+├── proto/                          # Proto source (owned by this service)
+│   ├── buf.yaml                    # name: buf.build/antinvestor/profile
+│   ├── buf.gen.yaml
+│   └── profile/v1/profile.proto
+├── apps/
+│   ├── default/
+│   │   ├── cmd/main.go
+│   │   ├── profile.openapi.yaml    # Generated OpenAPI (git-committed)
+│   │   └── service_profile.opl.ts  # Generated OPL (git-committed)
+│   └── devices/
+├── sdk/dart/profile/v1/            # Generated Dart SDK
+└── Makefile                        # Standardized (from common/templates/)
+```
+
+**Shared common types:**
+```
+github.com/antinvestor/common/      # Go module
+├── connection/                     # Client connection helpers
+├── interceptors/                   # Auth, partition interceptors
+├── permissions/                    # Permission extraction from proto
+├── v1/                             # Generated proto Go code (common types)
+└── tools/                          # inject-permissions, generate-opl
+```
+
+**Go clients come from BSR** — no local generation:
+```go
+import (
+    // BSR-generated (auto-published when proto is pushed)
+    "buf.build/gen/go/antinvestor/profile/connectrpc/go/profile/v1/profilev1connect"
+    profilepb "buf.build/gen/go/antinvestor/profile/protocolbuffers/go/profile/v1"
+)
 ```
 
 ---

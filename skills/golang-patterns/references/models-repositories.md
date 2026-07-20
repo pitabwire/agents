@@ -221,6 +221,51 @@ func (r *planMediaRepository) TenantStorageUsed(ctx context.Context, tenantID st
 
 ---
 
+## SQL Migrations
+
+**One entrypoint: `pool.Migrate(ctx, migrationsDirPath, models...)`** (the crawler wraps it as `repository.Migrate`). In the `DoDatabaseMigrate()` branch of `main` it does, in order: GORM **AutoMigrate** on the supplied `models...`, then **applies the SQL files** under `migrationsDirPath` (default `./migrations/0001`, shipped into the image via a Dockerfile `COPY … /migrations`), tracking applied files in a `migrations` table and running only the unapplied ones. So:
+
+> **AutoMigrate handles models; SQL files in the migrations folder handle everything AutoMigrate can't** (extensions, partial/filtered indexes, raw non-model tables, TimescaleDB hypertables). **Never** put that DDL in a Go helper that runs `db.Exec` (the `FinalizeSchema`/`EnsureServingTables` anti-pattern) — it's invisible, untracked, easy to break (a multi-statement `db.Exec` fails `cannot insert multiple commands into a prepared statement`, 42601), and it kept a service stuck 26 versions behind. Put it in files; let the migrator run it.
+
+Two hard constraints on the files:
+
+- **Migrations run as the application DB role** (never a superuser). Whatever a migration creates is owned by the app role.
+- **Frame v1.98+ runs each file as ONE prepared statement** — it cannot contain multiple SQL commands. Keep one statement per file (the prevailing convention: table in one file, each index in its own), or put multi-step logic in a single `DO $$ ... $$` block. Ops that cannot run inside a transaction (`REFRESH MATERIALIZED VIEW CONCURRENTLY`, `CREATE MATERIALIZED VIEW ... WITH (timescaledb.continuous)`) must run at app runtime instead, not in a migration.
+
+### Repeatability: every schema change flows through the migrator, as the app role
+
+The deploy must self-assemble from scratch with **zero manual steps** — starting over (fresh DB) requires nothing by hand. So **every** schema change, including one you want applied "right now", goes into a migration file applied by the migrator as the app role.
+
+**Never `psql -U postgres` (or any superuser) a schema change into a live DB.** The object then ends up owned by `postgres`, and the next migration — run as the app role — fails on `CREATE OR REPLACE` / `ALTER` / `DROP` with `ERROR: must be owner of <obj> (SQLSTATE 42501)`. That stalls the Helm release and can leave it unable to even roll back (the migration hook Job becomes a stalled resource), bouncing the deploy. *Real incident (2026-06): a procedure created live as `postgres` blocked every crawler deploy until ownership was reassigned by hand.* If you genuinely need an immediate effect, apply it **as the app role** (the app's credentials) — or just ship the migration and deploy. The app role cannot take ownership of a superuser-owned object on its own, so there is no in-migration recovery.
+
+### Idempotent + owner-robust DO block
+
+Make every statement re-runnable, and guard object creation so a pre-existing object (any owner) cannot trip the owner check:
+
+```sql
+-- 20260610_0131_example.sql — one DO block, applied as the app role
+DO $mig$
+BEGIN
+    IF to_regclass('my_table') IS NOT NULL THEN
+        EXECUTE 'ALTER TABLE my_table SET (autovacuum_vacuum_scale_factor = 0)';
+    END IF;
+    EXECUTE 'DROP INDEX IF EXISTS my_unused_idx';
+
+    -- Functions/procs: a guarded CREATE is owner-robust (skips if it already
+    -- exists, whatever the owner). CREATE OR REPLACE keeps content current but
+    -- REQUIRES ownership — fine only when the app role ever creates it.
+    IF NOT EXISTS (SELECT 1 FROM pg_proc WHERE proname = 'my_proc') THEN
+        EXECUTE $fn$ CREATE PROCEDURE my_proc(job_id INT, config JSONB)
+                     LANGUAGE plpgsql AS $body$ BEGIN /* ... */ END; $body$ $fn$;
+    END IF;
+END
+$mig$;
+```
+
+Idempotency cheatsheet: tables/extensions → `IF NOT EXISTS`; indexes → `CREATE INDEX IF NOT EXISTS` / `DROP INDEX IF EXISTS`; TimescaleDB policies/jobs → `if_not_exists => TRUE` or guard on `timescaledb_information.jobs`; functions → `CREATE OR REPLACE` (app-role-owned) or the `IF NOT EXISTS` guard above when out-of-band creation is possible.
+
+---
+
 ## Anti-Patterns
 
 | Don't | Do Instead |
@@ -231,3 +276,6 @@ func (r *planMediaRepository) TenantStorageUsed(ctx context.Context, tenantID st
 | Raw SQL in business logic | Create repository method |
 | Repository without interface | Define interface + struct |
 | Repository returning `any` | Return concrete types |
+| `psql -U postgres` a live schema change | Add a migration; the migrator applies it as the app role (consistent ownership, repeatable deploy) |
+| Go helper that runs DDL (`FinalizeSchema`-style `db.Exec`) | Put the DDL in a migration file; `pool.Migrate(dir, models)` applies it |
+| Read-modify-write mutation reading a replica (`DB(ctx, true)`) | Read the primary (`DB(ctx, false)`) — replica lag can miss a just-created row → silent NotFound |
