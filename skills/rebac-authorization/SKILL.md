@@ -1,8 +1,8 @@
 ---
 name: rebac-authorization
 description: "Comprehensive guide for the Relationship-Based Access Control (ReBAC) authorization system built on Ory Keto. Covers the three-plane model (data access, functional roles, per-resource access), contextual constraints (time/location), explicit per-namespace service account permissions, Keto tuple builders, OPL namespaces with permits, partition inheritance, ResourceAccessChecker, middleware, and event-driven tuple management. Use when working on authorization, permissions, access control, Keto tuples, constraints, or service bot access in the antinvestor platform."
-version: "6.3"
-last_updated: "2026-07-11"
+version: "6.7"
+last_updated: "2026-08-06"
 self_updating: true
 ---
 
@@ -21,6 +21,7 @@ self_updating: true
 8. New services are added to audience namespaces
 9. The consent flow or token webhook changes
 10. Frame library's checkers or claims API changes
+11. Product peer-mesh / S2S consumer authorization rules change (ADR 0002)
 
 **HOW to update:**
 1. Edit this file using the Edit tool
@@ -77,8 +78,13 @@ Authorization operates on **three distinct planes** using Ory Keto as the ReBAC 
 4. **Plane 1 always checked first** — `TenancyAccessChecker` interceptor runs before handler-level functional checks
 5. **Least privilege for service accounts** — each SA declares exactly which permissions it needs per namespace
 6. **Internal role string is `"internal"`** (Frame `ConstantSystemInternalRole`). SA type/`system_int` scope map to role `"internal"` at token enrichment
+7. **User-scoped platform self-service (mode U)** — logged-in partition **members** call profile/devices/geo/chat-agent/files with their JWT. Public clients auto-get those baseline audiences; **settings and notification are setup-only** (explicit SPA recipients). `ROLE_MEMBER` + OPL provide perms. No per-user SA grants.
+8. **Product peer mesh (mode B) ≠ per-tenant grants** — S2S audiences/grants live on the **platform product SA** once for BFF. Never migrate peer access “per customer.” See ADR 0002.
 
-Canonical doc: service-authentication `docs/IDENTITY_AND_AUTHORIZATION.md`.
+Canonical docs:
+- service-authentication `docs/IDENTITY_AND_AUTHORIZATION.md`
+- service-authentication `docs/adr/0002-product-peer-mesh-not-per-tenant-grants.md`
+- service-authentication `docs/PERMISSION_REGISTRATION.md`
 
 ---
 
@@ -158,6 +164,7 @@ Users with the `"internal"` role can operate across tenants via header-based con
 | `service_notification` | Notifications | notification_send/release/search/status_view/status_update, template_manage/view |
 | `service_commerce` | Commerce | shop_create, shops_view |
 | `service_trustage` | Trustage | event_ingest, workflow_manage/view, form_definition_manage/view, queue_manage/view |
+| `service_chat_agent` | Chat-agent | chat_agent_view, chat_agent_manage, chat_agent_turn |
 | `chat_room` | Chat | view, message_send, update, delete, members_manage (per-resource) |
 | `file` | Files | view, edit, delete, upload, share (per-resource) |
 
@@ -236,7 +243,9 @@ service_tenancy:t/p#granted_tenant_view       ← profile_id   (Plane 2)
 ```
 
 Service bot bootstrap (`EnsureServiceBotTenancyAccess`) writes Plane-1 `#service`
-for every SA **profile_id** across all known partitions so restarts self-heal.
+for every SA **profile_id** across all known partitions. Tenancy runs this
+**only in the setup Job** (`NameBootstrap`, alongside migrate / pending SA policy
+reconcile) — never on runtime cold start (Frame ≥ v2.1 setup plan).
 
 ### Legacy Format (Backward Compatible)
 
@@ -276,7 +285,14 @@ If partition has a parent:
 
 `CheckAccess(ctx)` auto-selects relation based on caller type:
 - Regular users → `tenancy_access:path#member`
-- `system_internal` → `tenancy_access:path#service`
+- roles include `"internal"` → `tenancy_access:path#service`
+
+**Default self-heal (Frame):** when an internal caller is denied Plane 1, the
+checker writes `tenancy_access:path#service ← profile_user:profileID` and
+retries once. Non-internal denials only log. Override with
+`WithOnTenancyAccessDenied`. Services may also wire an explicit
+`HealServiceTenancyAccess` callback (same semantics) for clarity before Frame
+upgrade.
 
 Wired as interceptor on all transports (Connect, HTTP, gRPC).
 
@@ -416,7 +432,8 @@ Checkers set `SubjectRef{Namespace: "profile_user", ID: **profileID**}` with emp
 | `keto/namespaces/tenancy.ts` | Production OPL schema |
 | *frame:* `security/security_claims.go` | `GetSubject`, `GetProfileID`, `ClaimsFromContext`, `IsInternalSystem` |
 | *frame:* `security/authorizer/client.go` | Keto gRPC adapter, `toKetoSubject`, parallelized `BatchCheck` via WorkerPool |
-| *frame:* `security/authorizer/tenancy_permission_checker.go` | TenancyAccessChecker (Plane 1), `WithTenancyConstraints()` |
+| *frame:* `security/authorizer/tenancy_permission_checker.go` | TenancyAccessChecker (Plane 1), default internal self-heal, `WithTenancyConstraints()` |
+| *frame:* `options_permissions.go` | `WithPermissionRegistration(sds...)` — multi-descriptor setup manifests (accumulate) |
 | *frame:* `security/authorizer/function_checker.go` | FunctionChecker (Plane 2), `WithFunctionConstraints()`, `WithFunctionPermissionConstraints()` |
 | *frame:* `security/authorizer/resource_access_checker.go` | ResourceAccessChecker (Plane 3), `WithConstraints()`, `WithPermissionConstraints()`, `Grant()`, `Revoke()`, `Members()` |
 | *frame:* `security/authorizer/constraints.go` | `AccessConstraint`, `TimeWindowConstraint`, `LocationConstraint`, `AnyConstraint`, context helpers |
@@ -443,6 +460,26 @@ Set audiences in new format:
 {"service_profile": ["profile_view", "partition_view"], "service_tenancy": ["tenant_view"]}
 ```
 Then trigger sync (`/_system/sync/clients`) to rewrite Keto tuples.
+
+### User-scoped platform APIs (location, devices, personal chat)
+
+After access grant with default **member** role, users already have `#member` tuples on registered namespaces. Ensure:
+
+1. Proto `ROLE_MEMBER` includes self-service writes (`location_ingest`, `device_manage`, `chat_agent_turn`, …)
+2. OPL permits include `this.related.member` for those permissions
+3. Public OAuth clients: Hydra sync adds baseline audiences via `ensurePublicPlatformAudiences` (no per-SPA SQL for platform paths)
+
+### Adding a product S2S peer (BFF only, e.g. matching → chat-agent)
+
+**Do not** write per-tenant migrations. Update the **consumer product SA** at platform root:
+
+1. Deploy: `requested_audience_paths` includes peer path
+2. `oauth_client_recipients` + SA policy grants for that product bot
+3. Clear `synced_at` / bump policy generation
+
+Three gates required for S2S. Prefer mode U (user JWT) when the API is personal.
+
+Canonical: `docs/adr/0002-product-peer-mesh-not-per-tenant-grants.md`.
 
 ### Adding a New Service Namespace
 1. **Define in proto**: Add `service_permissions` with namespace, permissions, and role_bindings to the service proto
@@ -484,7 +521,10 @@ opl/
     file_resources.opl.ts        # Hand-authored (Plane 3)
 ```
 - Generate with: `buf build proto/<svc> -o /dev/stdout | generate-opl opl/<svc>/`
-- The `opl-push` workflow recursively collects `*.opl.ts` from `opl/` and pushes to the deployments repo
+- On release tags, `opl-push` (antinvestor/common reusable workflow) merges
+  service `opl/**/*.opl.ts` classes into
+  `stawi-org/cloud.deployment` → `apps/identity-authorization-keto/files/namespaces.ts`
+  (production Keto GCS FUSE mount). Apply keto via app-apply after OPL merge.
 
 ### Debugging Permission Denied
 1. Check claims: `GetProfileID()`, TenantID, PartitionID — actor must be **profile_id**

@@ -3,12 +3,13 @@
 ## Table of Contents
 
 1. [Proto Permission Annotations](#proto-permission-annotations)
-2. [FunctionAccessInterceptor Wiring](#functionaccessinterceptor-wiring)
-3. [Self-Bypass Pattern](#self-bypass-pattern)
-4. [Resource-Level Checks](#resource-level-checks)
-5. [OPL Serving](#opl-serving)
-6. [Adding a New Service](#adding-a-new-service)
-7. [Adding a New RPC](#adding-a-new-rpc)
+2. [Permission Manifest Registration (Setup Only)](#permission-manifest-registration-setup-only)
+3. [FunctionAccessInterceptor Wiring](#functionaccessinterceptor-wiring)
+4. [Self-Bypass Pattern](#self-bypass-pattern)
+5. [Resource-Level Checks](#resource-level-checks)
+6. [OPL Serving](#opl-serving)
+7. [Adding a New Service](#adding-a-new-service)
+8. [Adding a New RPC](#adding-a-new-rpc)
 
 ---
 
@@ -68,6 +69,56 @@ ROLE_VIEWER    // Read-only
 ROLE_MEMBER    // Minimal read access
 ROLE_SERVICE   // Service-to-service (typically same as OWNER)
 ```
+
+---
+
+## Permission Manifest Registration (Setup Only)
+
+Frame **≥ v2.1** publishes permission manifests **only via the setup plan** — not PreStart, not runtime.
+
+| Concern | Rule |
+|---------|------|
+| When | Cloud Run setup Job: `argv=["setup"]` / `DO_SETUP=true` |
+| How | `frame.WithPermissionRegistration(sd)` then `RunSetupForProcess` |
+| Env | `PERMISSIONS_REGISTRATION_URL=https://api.stawi.org/tenancy/_internal/register/permissions` |
+| Auth | Service JWT with `roles` including **`internal`** (SA type) and `service_account_id` in claims |
+| Owner | Tenancy requires SA **name** or normalized **client_id** to match the namespace (`service_loans` / `service-loans`) |
+
+### Correct wiring (setup early-exit)
+
+```go
+sd := mypb.File_….Services().ByName("MyService") // has service_permissions
+if frame.ShouldRunSetup(&cfg) {
+    svc.Init(ctx, frame.WithPermissionRegistration(sd))
+    return svc.RunSetupForProcess(ctx, &cfg)
+}
+// Runtime: no WithPermissionRegistration
+```
+
+### Multi-service binaries
+
+Frame registers **one** setup step named `permissions`. Descriptors
+**accumulate**: pass multiple in one call, or call the option repeatedly —
+all publish under that single step (no silent overwrite of earlier namespaces).
+
+| App shape | Register in setup |
+|-----------|-------------------|
+| Single Connect service | That service’s descriptor |
+| Multi-service binary (e.g. billing+collection, trustage) | `WithPermissionRegistration(sd1, sd2, …)` — every descriptor with `service_permissions` |
+| Runtime + admin (e.g. limits) | **Admin** descriptor that owns `service_permissions` (or both if both own namespaces) |
+| Identity + field in one process | Identity under `service-identity` JWT; field needs `service-field` SA/setup when owned separately |
+
+### Forbidden
+
+- Registering permissions on Service start / PreStart
+- POSTing manifests from runtime code or manual ops scripts as the primary path
+- Registering a namespace your process SA does not own (tenancy **403**)
+
+### Ops recovery
+
+Re-run the app’s Cloud Run setup Job (same image, `setup` argv). Do not invent a parallel bootstrap path.
+
+See also: [frame-architecture.md § Setup vs Runtime](frame-architecture.md#setup-vs-runtime-hard-split).
 
 ---
 
@@ -237,9 +288,11 @@ sd := myservicepb.File_myservice_v1_myservice_proto.Services().ByName("MyService
 procMap := permissions.BuildProcedureMap(sd)
 functionChecker := authorizer.NewFunctionChecker(auth, permissions.ForService(sd).Namespace)
 ```
-4. **Register OPL** via `frame.WithOPL()`
-5. **No manual `authz.CanXxx()` calls needed** — interceptor handles it
-6. For resource-level access (Plane 3), create `opl/{name}_resources.opl.ts` and use `ResourceAccessChecker`
+4. **Register OPL** via `frame.WithOPL()` (runtime)
+5. **Setup Job path** — `WithPermissionRegistration(sd)` only under `ShouldRunSetup`; early `return` after `RunSetupForProcess`
+6. **Deploy** — `permissions_registration = true`, `migrate_args = ["setup"]` so the Job posts the manifest once
+7. **No manual `authz.CanXxx()` calls needed** — interceptor handles it
+8. For resource-level access (Plane 3), create `opl/{name}_resources.opl.ts` and use `ResourceAccessChecker`
 
 ---
 

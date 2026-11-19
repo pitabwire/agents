@@ -225,12 +225,12 @@ func (r *planMediaRepository) TenantStorageUsed(ctx context.Context, tenantID st
 
 **One entrypoint: `pool.Migrate(ctx, migrationsDirPath, models...)`** (the crawler wraps it as `repository.Migrate`). In the `DoDatabaseMigrate()` branch of `main` it does, in order: GORM **AutoMigrate** on the supplied `models...`, then **applies the SQL files** under `migrationsDirPath` (default `./migrations/0001`, shipped into the image via a Dockerfile `COPY … /migrations`), tracking applied files in a `migrations` table and running only the unapplied ones. So:
 
-> **AutoMigrate handles models; SQL files in the migrations folder handle everything AutoMigrate can't** (extensions, partial/filtered indexes, raw non-model tables, TimescaleDB hypertables). **Never** put that DDL in a Go helper that runs `db.Exec` (the `FinalizeSchema`/`EnsureServingTables` anti-pattern) — it's invisible, untracked, easy to break (a multi-statement `db.Exec` fails `cannot insert multiple commands into a prepared statement`, 42601), and it kept a service stuck 26 versions behind. Put it in files; let the migrator run it.
+> **AutoMigrate handles models; SQL files in the migrations folder handle everything AutoMigrate can't** (extensions, partial/filtered indexes, raw non-model tables). **Never** put that DDL in a Go helper that runs `db.Exec` (the `FinalizeSchema`/`EnsureServingTables` anti-pattern) — it's invisible, untracked, easy to break (a multi-statement `db.Exec` fails `cannot insert multiple commands into a prepared statement`, 42601), and it kept a service stuck 26 versions behind. Put it in files; let the migrator run it.
 
 Two hard constraints on the files:
 
 - **Migrations run as the application DB role** (never a superuser). Whatever a migration creates is owned by the app role.
-- **Frame v1.98+ runs each file as ONE prepared statement** — it cannot contain multiple SQL commands. Keep one statement per file (the prevailing convention: table in one file, each index in its own), or put multi-step logic in a single `DO $$ ... $$` block. Ops that cannot run inside a transaction (`REFRESH MATERIALIZED VIEW CONCURRENTLY`, `CREATE MATERIALIZED VIEW ... WITH (timescaledb.continuous)`) must run at app runtime instead, not in a migration.
+- **Frame v1.98+ runs each file as ONE prepared statement** — it cannot contain multiple SQL commands. Keep one statement per file (the prevailing convention: table in one file, each index in its own), or put multi-step logic in a single `DO $$ ... $$` block. Ops that cannot run inside a transaction (e.g. `REFRESH MATERIALIZED VIEW CONCURRENTLY`) must run at app runtime instead, not in a migration.
 
 ### Repeatability: every schema change flows through the migrator, as the app role
 
@@ -262,7 +262,7 @@ END
 $mig$;
 ```
 
-Idempotency cheatsheet: tables/extensions → `IF NOT EXISTS`; indexes → `CREATE INDEX IF NOT EXISTS` / `DROP INDEX IF EXISTS`; TimescaleDB policies/jobs → `if_not_exists => TRUE` or guard on `timescaledb_information.jobs`; functions → `CREATE OR REPLACE` (app-role-owned) or the `IF NOT EXISTS` guard above when out-of-band creation is possible.
+Idempotency cheatsheet: tables/extensions → `IF NOT EXISTS`; indexes → `CREATE INDEX IF NOT EXISTS` / `DROP INDEX IF EXISTS`; functions → `CREATE OR REPLACE` (app-role-owned) or the `IF NOT EXISTS` guard above when out-of-band creation is possible.
 
 ---
 

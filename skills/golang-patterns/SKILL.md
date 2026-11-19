@@ -1,8 +1,8 @@
 ---
 name: golang-patterns
-description: Idiomatic Go patterns using the Frame framework (github.com/pitabwire/frame), Connect RPC, and pitabwire/util conventions. Use when writing, reviewing, refactoring, or scaffolding Go code. Enforces three-layer architecture (handlers/business/repository), Frame abstractions for all infrastructure (database, cache, queue, HTTP, logging, telemetry), data.BaseModel for all models, datastore.BaseRepository for all repositories, util.Log(ctx) for all logging, and Connect RPC for all APIs. Also use when creating new Go projects or services (Frame blueprint scaffolding).
-version: "2.2"
-last_updated: "2026-06-28"
+description: Idiomatic Go patterns using the Frame framework (github.com/pitabwire/frame), Connect RPC, and pitabwire/util conventions. Use when writing, reviewing, refactoring, or scaffolding Go code. Enforces three-layer architecture (handlers/business/repository), Frame abstractions for all infrastructure (database, cache, queue, HTTP, logging, telemetry), hard setup-vs-runtime process split (migrate/permissions only in Cloud Run setup Jobs), client-level HTTP timeouts (never per-call micro-budgets), data.BaseModel for all models, datastore.BaseRepository for all repositories, util.Log(ctx) for all logging, and Connect RPC for all APIs. Also use when creating new Go projects or services (Frame blueprint scaffolding).
+version: "2.6"
+last_updated: "2026-07-30"
 self_updating: true
 ---
 
@@ -16,6 +16,7 @@ self_updating: true
 3. Connect RPC conventions change
 4. Project structure conventions evolve
 5. New anti-patterns are discovered
+6. Setup vs runtime bootstrap (migrate/permissions) conventions change
 
 **HOW to update:**
 1. Edit this SKILL.md using the Edit tool
@@ -32,12 +33,13 @@ Read these on-demand when working in the corresponding area:
 
 | Area | File | When to read |
 |------|------|-------------|
-| Frame service init, async processing (events/queue/workerpool) | [references/frame-architecture.md](references/frame-architecture.md) | Setting up services, choosing async patterns |
+| Frame service init, **setup vs runtime**, async (events/queue/workerpool) | [references/frame-architecture.md](references/frame-architecture.md) | Setting up services, choosing async patterns, bootstrap Jobs |
 | Connect RPC handlers, clients, streaming, error codes | [references/connect-rpc.md](references/connect-rpc.md) | Implementing or consuming APIs |
 | BaseModel, BaseRepository, custom queries | [references/models-repositories.md](references/models-repositories.md) | Defining models or data access |
 | Logging, tracing, metrics with util.Log and telemetry | [references/observability.md](references/observability.md) | Adding logging, tracing, or metrics |
 | HTTP client patterns with frame | [references/http-client.md](references/http-client.md) | Making HTTP requests or creating API clients |
 | Frame blueprint, project structure, asset files | [references/scaffolding.md](references/scaffolding.md) | Creating new projects or services |
+| Proto permissions, setup registration, OPL | [references/permissions-authorization.md](references/permissions-authorization.md) | Authz, permission manifests, setup Job registration |
 
 ---
 
@@ -97,7 +99,6 @@ For Antinvestor services, inspect the current `common` source and selected modul
 | Connect authentication, partition metadata, request/response logging | `github.com/antinvestor/common/interceptors` |
 | Permission descriptors, manifests, procedure maps | `github.com/antinvestor/common/permissions` and generated `common/v1` types |
 | Audit context, clients, interceptors, HTTP middleware | `github.com/antinvestor/common/audit` |
-| Timescale hypertables, compression, retention | `github.com/antinvestor/common/timescale` |
 | Service Makefiles, Buf setup, shared build targets | `Makefile.common` and `templates/` |
 
 Use this table only to route discovery; verify exported APIs in the current checkout before choosing or replacing them.
@@ -169,6 +170,160 @@ id := util.IDString()                          // ID generation
 token := util.RandomAlphaNumericString(32)     // Random strings
 defer util.CloseAndLogOnError(ctx, f, "msg")   // Deferred close
 ```
+
+### 7. Timeouts live on clients — never per-call micro-budgets
+
+**Set outbound deadlines once when constructing HTTP/Connect clients.** Handlers and business methods pass `req.Context()` (or the parent context) and let the client enforce the timeout (Frame default retries still apply).
+
+```go
+// CORRECT — construction time
+hydraHTTP := client.NewHTTPClient(context.Background(),
+    client.WithHTTPTimeout(2*time.Second),
+)
+// CORRECT — call site
+loginReq, err := hydra.GetLoginRequest(ctx, challenge)
+
+// FORBIDDEN — per-hop budgets scattered through handlers
+hydraCtx, cancel := context.WithTimeout(ctx, 120*time.Millisecond)
+defer cancel()
+loginReq, err := hydra.GetLoginRequest(hydraCtx, challenge)
+```
+
+| Rule | Detail |
+|------|--------|
+| One client per peer class | Hydra admin, Hydra public, external IdP, S2S — each with an explicit `WithHTTPTimeout` at init |
+| Soft-fail is control flow | Optional steps: log + continue. Do not invent a nested timeout just to “soft-fail faster” |
+| No `latency_budgets.go` maps | Do not maintain per-branch duration constants for every RPC in a request path |
+| Rare `WithTimeout` OK | Migration job wall clock, test suite bounds, pure in-process caps — **not** peer I/O |
+
+**Why this is mandatory:** micro-budgets (e.g. 120ms on Hydra) hard-fail real traffic when peers are briefly slow, produce opaque user errors, and create endless “raise the budget” churn. Client timeouts + soft-fail optional work fix the same class of gateway hangs without scattering deadlines.
+
+Full write-up: [references/http-client.md](references/http-client.md) (“Timeouts: set once on the client”).
+
+For external OAuth/OIDC (`oauth2.Exchange`, `oidc.NewProvider`), inject a timed Frame client via `oauth2.HTTPClient` in context — never rely on `http.DefaultClient`.
+
+### 8. Queue consumers have no wall-clock budget
+
+**Background event/queue work must run until the handler returns.** Do not wrap `Event.Execute` in `context.WithTimeout` “event budgets”.
+
+| Delivery | Frame behaviour (v2.0.8+) |
+|----------|---------------------------|
+| HTTP push | `FRAME_QUEUE_PUSH_HANDLER_TIMEOUT` defaults to **0** (no timeout). `http.Server.WriteTimeout` auto-unbounds when push has no handler deadline. |
+| Pull | Consumer processes the message without inventing per-event deadlines. |
+
+```go
+// FORBIDDEN — micro-managing queue work
+ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+defer cancel()
+return e.authorizer.WriteTuples(ctx, tuples)
+
+// CORRECT — use delivery context; peer clients enforce I/O limits
+return e.authorizer.WriteTuples(ctx, tuples)
+```
+
+Optional: chunk large batch writes for progress/idempotency — that is **not** a timeout. Retries for transient peer errors (Unavailable) are fine; inventing a 25s/2m “handler budget” is not.
+
+If a positive push SLA is truly required, set `FRAME_QUEUE_PUSH_HANDLER_TIMEOUT` explicitly — never paper over the default with `WithoutCancel` + per-handler timeouts.
+
+### 9. Never ignore cancellation you created (or inherited)
+
+**`context.WithoutCancel` is forbidden as a way to escape timeouts or cancelled parents** in application code.
+
+Creating a cancellable context (or accepting a parent that can cancel) and then discarding that signal is dangerous: work continues after the caller assumed it stopped, resources leak, and partial side effects race with retries.
+
+```go
+// FORBIDDEN — invent a deadline then ignore it
+ctx, cancel := context.WithTimeout(parent, 25*time.Second)
+defer cancel()
+workCtx := context.WithoutCancel(ctx)
+doWork(workCtx)
+
+// FORBIDDEN — paper over a short push/parent deadline
+ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), 2*time.Minute)
+
+// FORBIDDEN — "fire and forget" by stripping cancel from the request context
+emitCtx := context.WithoutCancel(req.Context())
+eventsMan.Emit(emitCtx, key, payload)
+
+// CORRECT — honour cancel; bound peers via HTTP clients only
+doWork(parent)
+if parent.Err() != nil {
+    return parent.Err() // or soft-skip optional work
+}
+eventsMan.Emit(parent, key, payload)
+```
+
+| Situation | Do |
+|-----------|-----|
+| Parent cancelled mid-handler | Return / soft-skip; do not strip cancel to “finish anyway” |
+| Queue work needs more time | Fix delivery (Frame push timeout = 0); do not `WithoutCancel` |
+| Optional best-effort side effect | Soft-skip if `ctx.Err() != nil`; or emit to a queue that owns its own delivery context |
+| Process startup / client construction | `context.Background()` is OK **only** for long-lived clients/managers, not for escaping a cancelled request |
+
+`context.Background()` for **service init** and **HTTP client construction** is fine. Using it (or `WithoutCancel`) to override a live request or event context is not.
+
+### 10. Setup vs runtime process split (MANDATORY)
+
+Frame services have **two process modes**. Do not blur them with PreStart hooks, ad-hoc scripts, one-shot curls, or “bootstrap on start” goroutines.
+
+| Mode | How it runs | Allowed work |
+|------|-------------|--------------|
+| **Setup** | Cloud Run **Job** `argv = ["setup"]` / `DO_SETUP=true` | One-time only: DB migrate, permission manifest registration, other Frame setup steps |
+| **Runtime** | Cloud Run **Service** | HTTP/RPC requests + **queue consumers** (+ domain reapers that process existing state) |
+
+**Rules**
+
+1. **Setup is the only place for one-time bootstrap** — schema migrations and permission publishing live in Frame’s setup plan (`ShouldRunSetup` → `RunSetupForProcess`).
+2. **Runtime never migrates and never re-registers permissions.** Wire `frame.WithPermissionRegistration` **only** on the setup early-return path, not on the runtime `Init` that serves traffic.
+3. **Setup path must exit early** — after `RunSetupForProcess`, `return`. Do not build peer clients, Connect handlers, or queue consumers before deciding setup vs runtime.
+4. **Recover by re-running the setup Job**, not hand-rolled POSTs to `/_internal/register/permissions` or random `go` one-offs.
+5. **One SA owns one permission namespace** — JWT `service_account_id` / SA `name` must match the namespace (e.g. `service_loans`). Multi-service binaries register **only** the descriptor their SA owns (e.g. limits: `LimitsAdminService` only; identity: `IdentityService` only — not Field under identity).
+6. **Frame keeps one setup step named `permissions`** — a second `WithPermissionRegistration` overwrites the first; never stack descriptors unless you intentionally replace the step.
+
+**Canonical `main.go` shape**
+
+```go
+ctx, svc := frame.NewServiceWithContext(tmpCtx,
+    frame.WithConfig(&cfg),
+    frame.WithDatastore(),
+)
+svc.Setup().RegisterFunc(setup.NameMigrate, func(ctx context.Context) error {
+    return repository.Migrate(ctx, svc.DatastoreManager(), cfg.GetDatabaseMigrationPath())
+})
+defer svc.Stop(ctx)
+
+// Setup Job only: migrate + permissions, then exit.
+sd := mypb.File_….Services().ByName("MyService") // owns service_permissions
+if frame.ShouldRunSetup(&cfg) {
+    svc.Init(ctx, frame.WithPermissionRegistration(sd))
+    if err := svc.RunSetupForProcess(ctx, &cfg); err != nil {
+        util.Log(ctx).WithError(err).Fatal("setup plan failed")
+    }
+    return
+}
+
+// Runtime only: HTTP + queue — no WithPermissionRegistration.
+// … peer clients, repos, handlers …
+svc.Init(ctx,
+    frame.WithHTTPHandler(connectHandler),
+    frame.WithRegisterEvents(/* durable handlers */),
+)
+if err := svc.Run(ctx, ""); err != nil {
+    util.Log(ctx).WithError(err).Fatal("could not run server")
+}
+```
+
+**Deploy knobs (cloud.deployment `frame-cloudrun-app`)**
+
+```hcl
+migrate_args             = ["setup"]   # full plan: migrate + permissions + …
+permissions_registration = true        # PERMISSIONS_REGISTRATION_URL + /tenancy audience
+migrate_execute          = false       # ship workflow / ops execute the Job
+```
+
+Ops recovery: `gcloud run jobs execute {app}-migrate` (or cloudrun-ship). Never invent a parallel bootstrap path.
+
+Full detail: [references/frame-architecture.md](references/frame-architecture.md#setup-vs-runtime-hard-split), [references/permissions-authorization.md](references/permissions-authorization.md#permission-manifest-registration-setup-only). Deployments: `cloud.deployment` `docs/FRAME_CLOUDRUN_APP.md`.
 
 ---
 
@@ -243,7 +398,8 @@ func initResources(_ context.Context) []definition.TestResource {
 | Unique ID | `util.IDString()` |
 | Random token | `util.RandomAlphaNumericString(32)` |
 | Close resource | `defer util.CloseAndLogOnError(ctx, closer, "msg")` |
-| HTTP client | `svc.HTTPClientManager().Client(ctx)` |
+| HTTP client | `svc.HTTPClientManager().Client(ctx)` or `client.NewHTTPClient(..., WithHTTPTimeout(...))` at init |
+| Outbound timeout | Client construction (`WithHTTPTimeout`) — not per-call `WithTimeout` |
 | Async job | `workerpool.SubmitJob()` |
 | Internal event | `eventsMan.Emit()` |
 | Database | `datastore.BaseRepository` |
@@ -292,6 +448,29 @@ func initResources(_ context.Context) []definition.TestResource {
 | `internal/` for shared code | `pkg/` for shared packages |
 | `panic` for errors | Return errors |
 | REST for service-to-service | Connect RPC |
+| Migrate / permission register on runtime start | Setup Job (`ShouldRunSetup` + `RunSetupForProcess`) only |
+| `WithPermissionRegistration` on runtime `Init` | Wire only on the setup early-return path |
+| Build peer clients/handlers before setup check | Early-exit setup **before** runtime wiring |
+| Second `WithPermissionRegistration` (overwrites step) | One owner descriptor per process SA |
+| Hand-rolled curl/scripts for permission bootstrap | Re-run Cloud Run setup Job |
+| Ad-hoc “go routines” / one-off jobs for one-time config | Registered Frame setup steps executed by the Job |
+
+### Timeouts & outbound I/O
+
+| Don't | Do Instead |
+|-------|-----------|
+| `context.WithTimeout` around every Hydra/RPC/HTTP hop | `client.WithHTTPTimeout` (or common Connect client options) at client construction |
+| `latency_budgets.go` / per-branch ms constants for each step | One timeout constant per peer client; soft-fail optional steps in control flow |
+| Nested `hydraCtx` / `profileCtx` / `tenCtx` budgets on one request | Pass `req.Context()`; let the client deadline fire |
+| Raise micro-budgets to “fix” production timeouts | Fix peer latency, cache, or soft-fail; keep client timeout as the real ceiling |
+| `oauth2.Exchange` / IdP calls on `http.DefaultClient` | Inject timed Frame client via `oauth2.HTTPClient` at provider setup |
+| Hand-rolled retry loops next to every call | Frame client default retry policy / client-level options |
+| `WithTimeout` around queue `Event.Execute` / “event budgets” | Let push/pull run to completion; bound only outbound clients |
+| `WithoutCancel` after `WithTimeout` / to escape a cancelled parent | Honour cancel; fix the real deadline source (client timeout, Frame push = 0) |
+| `WithoutCancel` + new timeout as “detached budget” | Same anti-pattern — you still invent a wall clock and ignore the parent |
+| Stripping cancel so optional work “always runs” | Soft-skip when `ctx.Err() != nil`, or enqueue work that has its own delivery context |
+
+**Reference implementation:** `service-authentication` `apps/default/service/handlers/client_timeouts.go` (construction-only constants) and `providers/http_client.go` (IdP client injection).
 
 ---
 
@@ -301,6 +480,10 @@ func initResources(_ context.Context) []definition.TestResource {
 - [ ] No `&http.Client{}` or `http.DefaultClient`
 - [ ] No `nats.Connect()`, `sql.Open()`, `redis.NewClient()`
 - [ ] No `log.Println()`, `log.Fatalf()`, `slog`, `fmt.Printf()` for logging
+- [ ] Outbound HTTP/Connect clients have timeouts set at construction (not per-call micro-budgets)
+- [ ] No new per-handler `context.WithTimeout` around peer I/O (Hydra, S2S, external IdP)
+- [ ] No wall-clock budgets on queue/event handlers (`Event.Execute`); Frame push default is unbounded
+- [ ] No `context.WithoutCancel` to escape request/event cancellation or pair with artificial timeouts
 
 **Code:**
 - [ ] Existing standard-library, Frame, util, generated-code, and project capabilities were reused before adding custom code
@@ -311,6 +494,10 @@ func initResources(_ context.Context) []definition.TestResource {
 - [ ] Three-layer architecture: handlers -> business -> repository
 - [ ] All errors wrapped with context (`fmt.Errorf("...: %w", err)`)
 - [ ] Using `util.IDString()` for ID generation
+- [ ] Optional steps soft-fail via control flow (log + continue), not nested deadline budgets
+- [ ] `main.go` has early setup exit: migrate + permissions only, then `return`
+- [ ] Runtime path has **no** `WithPermissionRegistration` / migrate side effects
+- [ ] Permission namespace owner matches the process SA (no cross-service register under wrong JWT)
 
 **Quality:**
 - [ ] `golangci-lint run` passes

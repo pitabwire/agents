@@ -62,7 +62,7 @@ Before implementing functionality:
 5. Add a dependency only when its lifecycle cost is lower than owning the equivalent custom code.
 6. Write custom functionality only for a verified gap. Document the gap and keep the custom surface minimal, observable, and thoroughly tested.
 
-`antinvestor/common` includes shared Go service clients and options, HTTP/Connect/gRPC/OAuth/workload transports, authentication/logging/partition interceptors, permissions and generated protobuf types, OpenAPI/OPL handlers, audit support, Timescale helpers, build templates, and the Flutter `antinvestor_ui_core` package. Treat this list as routing guidance and inspect the current source because the repository evolves.
+`antinvestor/common` includes shared Go service clients and options, HTTP/Connect/gRPC/OAuth/workload transports, authentication/logging/partition interceptors, permissions and generated protobuf types, OpenAPI/OPL handlers, audit support, build templates, and the Flutter `antinvestor_ui_core` package. Treat this list as routing guidance and inspect the current source because the repository evolves.
 
 Treat duplicated library behavior as a correctness and maintenance defect.
 

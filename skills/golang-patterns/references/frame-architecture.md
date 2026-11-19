@@ -3,46 +3,109 @@
 ## Table of Contents
 
 1. [Service Initialization](#service-initialization)
-2. [Frame Components Table](#frame-components-table)
-3. [Async Processing Decision Tree](#async-processing-decision-tree)
-4. [Frame Events Pattern](#frame-events-pattern)
-5. [Frame Queue Pattern](#frame-queue-pattern)
-6. [WorkerPool Pattern](#workerpool-pattern)
-7. [Swappable Infrastructure](#swappable-infrastructure)
+2. [Setup vs Runtime (Hard Split)](#setup-vs-runtime-hard-split)
+3. [Frame Components Table](#frame-components-table)
+4. [Async Processing Decision Tree](#async-processing-decision-tree)
+5. [Frame Events Pattern](#frame-events-pattern)
+6. [Frame Queue Pattern](#frame-queue-pattern)
+7. [WorkerPool Pattern](#workerpool-pattern)
+8. [Swappable Infrastructure](#swappable-infrastructure)
 
 ---
 
 ## Service Initialization
 
+Canonical production shape: **setup early-exit**, then **runtime-only wiring**.
+
 ```go
 func main() {
-    ctx := context.Background()
-
-    cfg, err := config.LoadWithOIDC[appconfig.Config](ctx)
+    tmpCtx := context.Background()
+    cfg, err := config.LoadWithOIDC[appconfig.Config](tmpCtx)
     if err != nil {
-        util.Log(ctx).WithError(err).Fatal("failed to load configuration")
+        util.Log(tmpCtx).WithError(err).Fatal("failed to load configuration")
     }
 
-    ctx, svc := frame.NewServiceWithContext(ctx,
-        frame.WithName("service-name"),
+    ctx, svc := frame.NewServiceWithContext(tmpCtx,
         frame.WithConfig(&cfg),
-        frame.WithRegisterServerOauth2Client(),
         frame.WithDatastore(),
-        frame.WithCacheManager(),
-        frame.WithHTTPHandler(handler),
     )
+    defer svc.Stop(ctx)
 
+    // Always register migrate on the setup registry.
+    svc.Setup().RegisterFunc(setup.NameMigrate, func(ctx context.Context) error {
+        return repository.Migrate(ctx, svc.DatastoreManager(), cfg.GetDatabaseMigrationPath())
+    })
+
+    // ── Setup Job path (Cloud Run Job argv ["setup"] / DO_SETUP) ──
+    // One-time work only. No peer clients, HTTP, or queue consumers.
+    sd := mypb.File_….Services().ByName("MyService")
+    if frame.ShouldRunSetup(&cfg) {
+        svc.Init(ctx, frame.WithPermissionRegistration(sd))
+        if err := svc.RunSetupForProcess(ctx, &cfg); err != nil {
+            util.Log(ctx).WithError(err).Fatal("setup plan failed")
+        }
+        return
+    }
+
+    // ── Runtime path (Cloud Run Service) ──
+    // Requests + queue work only. Never migrate or re-register permissions.
+    connectHandler := setupConnectServer(ctx, svc)
     svc.Init(ctx,
-        frame.WithRegisterPublisher("queue-name", cfg.QueueURL),
-        frame.WithRegisterSubscriber("queue-name", cfg.QueueURL, subscriptionHandler),
-        frame.WithRegisterEvents(eventHandlers...),
+        frame.WithHTTPHandler(connectHandler),
+        frame.WithRegisterEvents(/* durable handlers */),
+        // optional: publishers/subscribers
     )
-
-    if err := svc.Run(ctx, cfg.ServerPort); err != nil {
+    if err := svc.Run(ctx, ""); err != nil {
         util.Log(ctx).WithError(err).Fatal("failed to run service")
     }
 }
 ```
+
+---
+
+## Setup vs Runtime (Hard Split)
+
+| Mode | Trigger | Process role |
+|------|---------|--------------|
+| **Setup** | Job `args = ["setup"]`, `DO_SETUP=true` | Ephemeral bootstrap; exits when plan finishes |
+| **Runtime** | Long-lived Service | Serves Connect/HTTP and consumes queues |
+
+### What belongs in setup
+
+| Step | Mechanism |
+|------|-----------|
+| Schema migrate | `svc.Setup().RegisterFunc(setup.NameMigrate, …)` |
+| Permission manifests | `frame.WithPermissionRegistration(sd)` **only inside** `if ShouldRunSetup` |
+| Other one-time steps | Named steps on `svc.Setup()`; run via `RunSetupForProcess` |
+
+### What belongs in runtime
+
+| Work | Mechanism |
+|------|-----------|
+| API traffic | Connect handlers + interceptors |
+| Durable async | `WithRegisterEvents` / queue subscribers |
+| Domain reapers / periodic cleanup | Bounded loops **only if** they process **existing** domain state (not bootstrap) |
+
+### Forbidden
+
+| Anti-pattern | Why |
+|--------------|-----|
+| Migrate or POST permissions on Service start | Couples deploy traffic to bootstrap; races multi-replica starts |
+| `WithPermissionRegistration` on the runtime `Init` | Blurs modes; permissions are setup-plan only (Frame ≥ v2.1) |
+| Building OAuth clients / full handler graph **before** `ShouldRunSetup` | Setup Jobs need DB only; peer deps make Jobs fragile |
+| Second `WithPermissionRegistration` call | Overwrites the single `permissions` setup step |
+| Hand-rolled curl/scripts for register/migrate | Drift from the Job plan; use `gcloud run jobs execute {app}-migrate` |
+| Ad-hoc goroutines for “bootstrap once” | Unreliable; use setup steps or queue-driven workers |
+
+### Deploy contract (cloud.deployment)
+
+```hcl
+migrate_args             = ["setup"]
+permissions_registration = true   # injects PERMISSIONS_REGISTRATION_URL
+migrate_execute          = false  # cloudrun-ship / ops execute the Job
+```
+
+Ship flow: **build image → update Job → execute setup → update Service**. Runtime never re-does setup.
 
 ---
 
